@@ -211,7 +211,7 @@ cols_to_show = [
     'Z_Spread_14_MA', 'Z_Spread_30_MA', 
     'Unified_Oscillator_Deg', 'Fisher', 'Delta_Hybrid', 'Signal'
 ]
-df_display = df[cols_to_show].tail(100).reset_index()
+df_display = df[cols_to_show].tail(1000).reset_index()
 
 # Row highlighting for Signals
 def highlight_row(row):
