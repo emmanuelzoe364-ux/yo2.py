@@ -8,7 +8,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import logging 
 from PIL import Image
-import yfinance as yf  # Replaced Binance with yfinance
+import yfinance as yf
 
 # ==========================================
 # ⚙️ CONFIGURATION & SETUP
@@ -47,13 +47,10 @@ def calculate_delta_hybrid(roc, z_ratio):
 # 🎛️ SIDEBAR SETTINGS
 # ==========================================
 st.sidebar.header("Agile Settings")
-# Yahoo Finance symbols
 TICKERS_YF = {"BTCUSDT": "BTC-USD", "ETHUSDT": "ETH-USD"}
 
 period_days = st.sidebar.number_input("Fetch period (days)", min_value=1, max_value=59, value=7) 
-interval = st.sidebar.selectbox("Interval", options=["1m", "2m", "5m", "15m", "30m", "60m", "90m", "1h", "1d"], index=3) 
-
-st.sidebar.info("Note: 1m interval is limited to last 7 days. Max period for sub-day intervals is 59 days.")
+interval = st.sidebar.selectbox("Interval", options=["1m", "2m", "5m", "15m", "30m", "60m", "1h", "1d"], index=3) 
 
 st.sidebar.markdown("---")
 index_ema_span = st.sidebar.number_input("Cumulative Index EMA Span", min_value=1, max_value=10, value=5)
@@ -63,12 +60,11 @@ ema_very_long = 72
 st.sidebar.markdown("---")
 z_lookback_base = st.sidebar.number_input("Base Z-Lookback", min_value=10, max_value=500, value=168)
 z_threshold = st.sidebar.slider("Signal Z-Threshold", 1.0, 3.0, 2.0)
-corr_threshold = st.sidebar.slider("Correlation Threshold", 0.0, 1.0, 0.70)
+corr_threshold = st.sidebar.slider("Correlation Limit (Visual only)", 0.0, 1.0, 0.70)
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Fisher/Delta Settings")
 fisher_window = st.sidebar.number_input("Fisher Window", value=10)
-volume_length = 14
 
 # ==========================================
 # 📥 DATA FETCHING ENGINE (YFINANCE)
@@ -76,34 +72,33 @@ volume_length = 14
 @st.cache_data(ttl=timedelta(minutes=5))
 def fetch_and_process_data(tickers_dict, period_days, interval_str, index_ema_span, z_lookback_base, fisher_window):
     try:
-        # yfinance period format (e.g., '7d')
         yf_period = f"{period_days}d"
-        
-        # Download data for all tickers
         symbols = list(tickers_dict.values())
         data = yf.download(tickers=symbols, period=yf_period, interval=interval_str, group_by='ticker', auto_adjust=True)
         
         if data.empty:
             return pd.DataFrame()
 
-        # Extract data into a usable format
         df_list = []
         for raw_sym, yf_sym in tickers_dict.items():
-            temp = data[yf_sym][['Close', 'Volume']].copy()
-            temp.columns = [raw_sym.replace('USDT', ''), f"{raw_sym.replace('USDT', '')}_vol"]
+            col_name = raw_sym.replace('USDT', '')
+            temp = data[yf_sym][['Close']].copy()
+            temp.columns = [col_name]
             df_list.append(temp)
         
-        df = pd.concat(df_list, axis=1).dropna()
+        # Merge and fill tiny gaps in data feed
+        df = pd.concat(df_list, axis=1)
+        df = df.ffill(limit=3).dropna()
         
         # 1. Rolling Correlation
-        df['Rolling_Corr'] = df['BTC'].rolling(window=20).corr(df['ETH']) # Simplified window for stability
+        df['Rolling_Corr'] = df['BTC'].rolling(window=20).corr(df['ETH'])
 
         # 2. Adaptive Lookback
         returns = df['BTC'].pct_change()
         volatility = returns.rolling(window=z_lookback_base).std()
         mean_vol = volatility.rolling(window=z_lookback_base*2).mean()
         vol_ratio = (volatility / mean_vol).fillna(1.0)
-        df['Adaptive_Lookback'] = (z_lookback_base / vol_ratio).clip(z_lookback_base*0.5, z_lookback_base*2.0).astype(int)
+        df['Adaptive_Lookback'] = (z_lookback_base / vol_ratio).clip(z_lookback_base*0.5, z_lookback_base*2.0).fillna(z_lookback_base).astype(int)
 
         # 3. Normalized Prices & Index
         df['btc_cum'] = df['BTC'] / df['BTC'].rolling(window=z_lookback_base).mean()
@@ -121,9 +116,9 @@ def fetch_and_process_data(tickers_dict, period_days, interval_str, index_ema_sp
         lookbacks = df['Adaptive_Lookback'].values
         z_ratios = np.full(len(df), np.nan)
         for i in range(z_lookback_base, len(df)):
-            w = lookbacks[i]
+            w = int(lookbacks[i])
             subset = lr_vals[max(0, i-w):i]
-            if len(subset) > 0 and np.std(subset) > 0:
+            if len(subset) > 1 and np.std(subset) > 0:
                 z_ratios[i] = (lr_vals[i] - np.mean(subset)) / np.std(subset)
         df['Z_Ratio'] = z_ratios
 
@@ -145,14 +140,10 @@ def fetch_and_process_data(tickers_dict, period_days, interval_str, index_ema_sp
         df['Fisher'] = calculate_fisher_transform(df['LR_ROC'], window=fisher_window)
         df['Delta_Hybrid'] = calculate_delta_hybrid(df['LR_ROC'], df['Z_Ratio'])
 
-        # Apply Mask
-        mask = df['Rolling_Corr'] < corr_threshold
-        cols_to_mask = ['Z_Ratio', 'Unified_Oscillator_Deg', 'Raw_Angle', 'Fisher', 'Delta_Hybrid']
-        df.loc[mask, cols_to_mask] = np.nan
-
+        # NOTE: CORRELATION MASK REMOVED TO PREVENT PLOT BREAKAGES
         return df.dropna(subset=['index_cum_smooth'])
     except Exception as e:
-        st.error(f"Error in data processing: {e}")
+        st.error(f"Data Error: {e}")
         return pd.DataFrame()
 
 # ==========================================
@@ -169,11 +160,11 @@ def apply_signals(df, z_thr):
     df.loc[short_setup & short_trigger, 'Signal'] = 'SHORT'
     return df
 
-# Execute
+# Execute Processing
 df = fetch_and_process_data(TICKERS_YF, period_days, interval, index_ema_span, z_lookback_base, fisher_window)
 
 if df.empty:
-    st.warning("No data found. Adjust your lookback period or check your internet connection.")
+    st.warning("No data returned. Try a different period or interval.")
     st.stop()
 
 df = apply_signals(df, z_threshold)
@@ -185,28 +176,34 @@ fig = make_subplots(rows=5, cols=1, shared_xaxes=True,
                     row_heights=[0.35, 0.15, 0.15, 0.15, 0.20],
                     vertical_spacing=0.03)
 
-fig.add_trace(go.Scatter(x=df.index, y=df['index_cum_smooth'], name='Index', line=dict(color='#0077c9', width=2)), row=1, col=1)
-fig.add_trace(go.Scatter(x=df.index, y=df['EMA_long'], name='EMA 30', line=dict(color='red', width=1)), row=1, col=1)
-fig.add_trace(go.Scatter(x=df.index, y=df['EMA_very_long'], name='EMA 72', line=dict(color='purple', dash='dot')), row=1, col=1) 
+# Row 1: Index
+fig.add_trace(go.Scatter(x=df.index, y=df['index_cum_smooth'], name='Index', line=dict(color='#0077c9', width=2), connectgaps=True), row=1, col=1)
+fig.add_trace(go.Scatter(x=df.index, y=df['EMA_long'], name='EMA 30', line=dict(color='red', width=1), connectgaps=True), row=1, col=1)
+fig.add_trace(go.Scatter(x=df.index, y=df['EMA_very_long'], name='EMA 72', line=dict(color='purple', dash='dot'), connectgaps=True), row=1, col=1) 
 
-fig.add_trace(go.Scatter(x=df.index, y=df['Z_Ratio'], name='Z-Ratio', line=dict(color='orange')), row=2, col=1)
+# Row 2: Z-Ratio
+fig.add_trace(go.Scatter(x=df.index, y=df['Z_Ratio'], name='Z-Ratio', line=dict(color='orange'), connectgaps=True), row=2, col=1)
 fig.add_hline(y=z_threshold, line=dict(color='red', dash='dot'), row=2, col=1)
 fig.add_hline(y=-z_threshold, line=dict(color='green', dash='dot'), row=2, col=1)
 fig.add_hline(y=0, line=dict(color='gray', width=0.5), row=2, col=1)
 
-fig.add_trace(go.Scatter(x=df.index, y=df['Unified_Oscillator_Deg'], name='Angle', line=dict(color='yellow')), row=3, col=1)
+# Row 3: Angle
+fig.add_trace(go.Scatter(x=df.index, y=df['Unified_Oscillator_Deg'], name='Angle', line=dict(color='yellow'), connectgaps=True), row=3, col=1)
 fig.add_hline(y=0, row=3, col=1)
 
-fig.add_trace(go.Scatter(x=df.index, y=df['Fisher'], name='Fisher', line=dict(color='cyan')), row=4, col=1)
+# Row 4: Fisher
+fig.add_trace(go.Scatter(x=df.index, y=df['Fisher'], name='Fisher', line=dict(color='cyan'), connectgaps=True), row=4, col=1)
 fig.add_hline(y=0, row=4, col=1)
 
-fig.add_trace(go.Scatter(x=df.index, y=df['Delta_Hybrid'], name='Delta Hybrid', line=dict(color='lime')), row=5, col=1)
+# Row 5: Delta
+fig.add_trace(go.Scatter(x=df.index, y=df['Delta_Hybrid'], name='Delta Hybrid', line=dict(color='lime'), connectgaps=True), row=5, col=1)
 fig.add_hline(y=0, row=5, col=1)
 
+# Highlight Signals
 for idx, row in df[df['Signal'] == 'LONG'].iterrows():
-    fig.add_vline(x=idx, line=dict(color='green', width=1, dash='dot'), opacity=0.3)
+    fig.add_vline(x=idx, line=dict(color='green', width=1, dash='dot'), opacity=0.4)
 for idx, row in df[df['Signal'] == 'SHORT'].iterrows():
-    fig.add_vline(x=idx, line=dict(color='red', width=1, dash='dot'), opacity=0.3)
+    fig.add_vline(x=idx, line=dict(color='red', width=1, dash='dot'), opacity=0.4)
 
 fig.update_layout(height=1000, template="plotly_dark", hovermode="x unified", 
                   margin=dict(l=50, r=50, t=50, b=50))
@@ -217,21 +214,30 @@ st.plotly_chart(fig, use_container_width=True)
 # 📑 DATA FEED
 # ==========================================
 st.markdown("### 📋 Market Data & Signals")
-data_cols = ['BTC', 'ETH', 'Z_Ratio', 'Z_Spread_14_MA', 'Z_Spread_30_MA', 'Unified_Oscillator_Deg', 'Fisher', 'Delta_Hybrid', 'Signal']
-df_view = df[data_cols].tail(100).copy()
+
+# Select columns that actually exist in df
+display_cols = ['BTC', 'ETH', 'Z_Ratio', 'Z_Spread_14_MA', 'Z_Spread_30_MA', 'Unified_Oscillator_Deg', 'Fisher', 'Delta_Hybrid', 'Signal']
+available_cols = [c for c in display_cols if c in df.columns]
+
+df_view = df[available_cols].tail(100).copy()
 
 def color_signal(val):
     if val == 'LONG': return 'color: #00FF00; font-weight: bold'
     if val == 'SHORT': return 'color: #FF0000; font-weight: bold'
     return ''
 
+# Render Dataframe
 st.dataframe(
-    df_view.style.applymap(color_signal, subset=['Signal']).format({c: "{:.4f}" for c in data_cols if c not in ['Signal', 'BTC', 'ETH']}),
+    df_view.style.applymap(color_signal, subset=['Signal'] if 'Signal' in df_view.columns else []).format(
+        {c: "{:.4f}" for c in available_cols if c not in ['Signal', 'BTC', 'ETH']}
+    ),
     use_container_width=True,
+    height=400,
     column_config={
         "BTC": st.column_config.NumberColumn("BTC Price", format="$%.2f"),
         "ETH": st.column_config.NumberColumn("ETH Price", format="$%.2f"),
-        "Unified_Oscillator_Deg": st.column_config.NumberColumn("Angle", format="%.1f°")
+        "Unified_Oscillator_Deg": st.column_config.NumberColumn("Angle", format="%.1f°"),
+        "Z_Ratio": st.column_config.NumberColumn("Z-Ratio", format="%.3f")
     }
 )
 
